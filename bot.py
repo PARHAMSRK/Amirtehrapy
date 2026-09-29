@@ -1,117 +1,207 @@
 import os
-import sqlite3
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from telebot import types
+from dotenv import load_dotenv
 
-TOKEN = "8770717041:AAGyJyV2aHz2Bb8CXBXYBfmU2ZL8a29KjW8"
-ADMIN_ID = 6336833078
+from database import init_db, set_user_language, get_user_language
+from handlers.admin import register_admin_handlers
+from handlers.appointment import register_appointment_handlers
+from handlers.payment import register_payment_handlers, is_payment_pending, process_payment_text
 
-# مسیر دیتابیس (می‌تواند به دیتابیس مشترک یا ابری متصل شود)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.path.join(BASE_DIR, "database.db")
+load_dotenv()
+TOKEN = os.getenv("TELEBOT_TOKEN")
 
-bot = telebot.TeleBot(TOKEN)
+if not TOKEN:
+    raise ValueError("توکن ربات تلگرام در فایل .env یافت نشد!")
 
-MESSAGES = {
-    'fa': {
-        'welcome_admin': (
-            "🌿 **سلام و درود، استاد AMIR MOSHAVERI عزیز!**\n\n"
-            "به پنل مدیریت کلینیک **AMIR PSYCARE** خوش آمدید. ✨"
-        ),
-        'welcome_client': (
-            "🌿 **به کلینیک تخصصی روانشناختی AMIR PSYCARE خوش آمدید.**\n\n"
-            "جهت رزرو نوبت مشاوره آنلاین، از دکمه زیر استفاده کنید:"
-        ),
-        'btn_book': "📅 درخواست وقت مشاوره / Book Session",
-        'btn_contact': "💬 ارتباط با پشتیبانی / مدیریت",
-        'btn_lang': "🌐 تغییر زبان / Change Language",
-        'btn_reports': "📊 پنل گزارش‌ها و مالی",
-        'btn_stats': "📈 آمار سریع رزروها",
-        'btn_webapp': "🌐 ورود به وب‌اپلیکیشن",
-        'lang_set': "✅ زبان شما با موفقیت روی **فارسی** تنظیم شد."
-    },
-    'en': {
-        'welcome_admin': (
-            "🌿 **Welcome, Dr. AMIR MOSHAVERI!**\n\n"
-            "Welcome to the **AMIR PSYCARE** Management Panel. ✨"
-        ),
-        'welcome_client': (
-            "🌿 **Welcome to AMIR PSYCARE Clinic.**\n\n"
-            "Please use the button below to book an online consultation:"
-        ),
-        'btn_book': "📅 Book a Session",
-        'btn_contact': "💬 Contact Support / Admin",
-        'btn_lang': "🌐 Change Language / تغییر زبان",
-        'btn_reports': "📊 Financial & Reports Panel",
-        'btn_stats': "📈 Quick Statistics",
-        'btn_webapp': "🌐 Open Web App",
-        'lang_set': "✅ Your language has been set to **English**."
-    }
-}
+# راه‌اندازی سشن سفارشی با قابلیت Retry برای پایداری بیشتر روی پایتون‌انی‌ویر
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=1, status_forcelist=[502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries))
 
-def get_user_lang(user_id):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT language FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else 'fa'
-    except Exception:
-        return 'fa'
+bot = telebot.TeleBot(TOKEN, threaded=False)
+bot.telebot_session = session
 
-def set_user_lang(user_id, lang):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO users (user_id, language) VALUES (?, ?)", (user_id, lang))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"DB Error: {e}")
+init_db()
+
+register_admin_handlers(bot)
+register_appointment_handlers(bot)
+register_payment_handlers(bot)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
-    lang = get_user_lang(user_id)
-    msg = MESSAGES.get(lang, MESSAGES['fa'])
-    
-    if int(user_id) == int(ADMIN_ID):
-        markup = InlineKeyboardMarkup(row_width=2)
-        btn_reports = InlineKeyboardButton(msg['btn_reports'], url="https://Amirtherapy.pythonanywhere.com/reports")
-        btn_stats = InlineKeyboardButton(msg['btn_stats'], callback_data="admin_stats")
-        btn_web_app = InlineKeyboardButton(msg['btn_webapp'], web_app=WebAppInfo(url="https://Amirtherapy.pythonanywhere.com"))
-        markup.add(btn_reports, btn_stats, btn_web_app)
-        bot.send_message(message.chat.id, msg['welcome_admin'], parse_mode="Markdown", reply_markup=markup)
+
+    # During payment, /start must not break the payment flow.
+    if is_payment_pending(user_id):
+        process_payment_text(message)
+        return
+
+    current_lang = get_user_language(user_id)
+
+    if not current_lang:
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("🇮🇷 فارسی", callback_data="set_lang_fa"),
+            types.InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en")
+        )
+        bot.send_message(
+            message.chat.id,
+            "لطفاً زبان خود را انتخاب کنید / Please choose your language:",
+            reply_markup=markup
+        )
+        return
+
+    show_main_menu(message.chat.id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_lang_"))
+def set_language_callback(call):
+    user_id = call.from_user.id
+    lang = "fa" if call.data == "set_lang_fa" else "en"
+    set_user_language(user_id, lang)
+    bot.answer_callback_query(call.id, "✅ زبان تنظیم شد" if lang == "fa" else "✅ Language set")
+
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+    show_main_menu(call.message.chat.id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "change_language")
+def change_language_menu(call):
+    bot.answer_callback_query(call.id)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🇮🇷 فارسی", callback_data="set_lang_fa"),
+        types.InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en"),
+        types.InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")
+    )
+    bot.edit_message_text(
+        "🌐 لطفاً زبان مورد نظر خود را انتخاب کنید:\nChoose your preferred language:",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=markup
+    )
+
+def show_main_menu(chat_id, user_id):
+    lang = get_user_language(user_id) or "fa"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if lang == "en":
+        markup.add(
+            types.InlineKeyboardButton("📅 Book Appointment", callback_data="appointment"),
+            types.InlineKeyboardButton("💰 Service Pricing", callback_data="service_pricing"),
+            types.InlineKeyboardButton("🌐 Change Language", callback_data="change_language"),
+            types.InlineKeyboardButton("👨‍⚕️ About Psychologist", callback_data="about_psychologist"),
+            types.InlineKeyboardButton("💬 Support", url="https://t.me/Revenant1001")
+        )
+        welcome_text = "Welcome to Smart Psychology / Counseling System 🌿 **AMIR PSYCHOLOGY**"
     else:
-        markup = InlineKeyboardMarkup(row_width=1)
-        btn_app = InlineKeyboardButton(msg['btn_book'], web_app=WebAppInfo(url=f"https://Amirtherapy.pythonanywhere.com?lang={lang}"))
-        btn_contact = InlineKeyboardButton(msg['btn_contact'], url="https://t.me/Revenant1001")
-        markup.add(btn_app, btn_contact)
-        bot.send_message(message.chat.id, msg['welcome_client'], parse_mode="Markdown", reply_markup=markup)
+        markup.add(
+            types.InlineKeyboardButton("📅 رزرو نوبت", callback_data="appointment"),
+            types.InlineKeyboardButton("💰 تعرفه خدمات", callback_data="service_pricing"),
+            types.InlineKeyboardButton("🌐 تغییر زبان", callback_data="change_language"),
+            types.InlineKeyboardButton("👨‍⚕️ درباره روانشناس", callback_data="about_psychologist"),
+            types.InlineKeyboardButton("💬 پشتیبانی", url="https://t.me/Revenant1001")
+        )
+        welcome_text = "به سیستم هوشمند روانشناسی / مشاوره 🌿 **AMIR PSYCHOLOGY** خوش آمدید"
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_stats")
-def show_admin_stats(call):
-    if int(call.from_user.id) == int(ADMIN_ID):
-        try:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*), status FROM appointments GROUP BY status")
-            stats = cursor.fetchall()
-            conn.close()
+    bot.send_message(chat_id, welcome_text, parse_mode="Markdown", reply_markup=markup)
 
-            stats_msg = "📊 **آمار سریع سیستم AMIR PSYCARE:**\n\n"
-            if stats:
-                for count, status in stats:
-                    stats_msg += f"• وضعیت `{status}`: *{count}* نوبت\n"
-            else:
-                stats_msg += "هنوز رزروی در سیستم ثبت نشده است."
+@bot.callback_query_handler(func=lambda call: call.data == "service_pricing")
+def show_service_pricing(call):
+    user_id = call.from_user.id
+    lang = get_user_language(user_id) or "fa"
+    bot.answer_callback_query(call.id)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if lang == "en":
+        text = (
+            "💎 **AMIR PSYCHOLOGY — Consultation Fees**\n\n"
+            "Please select a fee below for information only.\n"
+            "The displayed fees are informational and are not a reservation."
+        )
+        markup.add(
+            types.InlineKeyboardButton("⏱ 40 Minutes Consultation / $10 USD", callback_data="pricing_info_40"),
+            types.InlineKeyboardButton("⏱ 60 Minutes Consultation / $15 USD", callback_data="pricing_info_60"),
+            types.InlineKeyboardButton("⏱ 80 Minutes Consultation / $20 USD", callback_data="pricing_info_80"),
+            types.InlineKeyboardButton("📅 Book Appointment", callback_data="appointment")
+        )
+        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="pricing_main"))
+    else:
+        text = (
+            "💎 **تعرفه خدمات AMIR PSYCHOLOGY**\n\n"
+            "برای مشاهده جزئیات هر تعرفه، گزینه موردنظر را انتخاب کنید.\n"
+            "این تعرفه‌ها صرفاً جهت اطلاع هستند و به معنی ثبت رزرو نیستند."
+        )
+        markup.add(
+            types.InlineKeyboardButton("⏱ ۴۰ دقیقه مشاوره / ۶۰۰٬۰۰۰ تومان", callback_data="pricing_info_40"),
+            types.InlineKeyboardButton("⏱ ۶۰ دقیقه مشاوره / ۸۰۰٬۰۰۰ تومان", callback_data="pricing_info_60"),
+            types.InlineKeyboardButton("⏱ ۸۰ دقیقه مشاوره / ۱٬۰۰۰٬۰۰۰ تومان", callback_data="pricing_info_80"),
+            types.InlineKeyboardButton("📅 رزرو نوبت", callback_data="appointment")
+        )
+        markup.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="pricing_main"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
 
-            bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id, stats_msg, parse_mode="Markdown")
-        except Exception:
-            bot.answer_callback_query(call.id, "خطا در دریافت آمار!")
+@bot.callback_query_handler(func=lambda call: call.data in ["pricing_info_40", "pricing_info_60", "pricing_info_80"])
+def pricing_info_notice(call):
+    lang = get_user_language(call.from_user.id) or "fa"
+    notice = (
+        "جهت رزرو نوبت به منوی اصلی بازگردید!"
+        if lang == "fa" else
+        "To book an appointment, please return to the main menu!"
+    )
+    bot.answer_callback_query(call.id, text=notice, show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "pricing_main")
+def pricing_main(call):
+    user_id = call.from_user.id
+    lang = get_user_language(user_id) or "fa"
+    bot.answer_callback_query(
+        call.id,
+        "🏠 بازگشت به منوی اصلی" if lang == "fa" else "🏠 Back to the main menu",
+        show_alert=True
+    )
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    show_main_menu(call.message.chat.id, user_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
+def back_to_main_menu(call):
+    lang = get_user_language(call.from_user.id) or "fa"
+    bot.answer_callback_query(
+        call.id,
+        "🔙 بازگشت به منوی اصلی" if lang == "fa" else "🔙 Back to the main menu",
+        show_alert=True
+    )
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    show_main_menu(call.message.chat.id, call.from_user.id)
+
+@bot.message_handler(func=lambda message: True)
+def handle_fallback_messages(message):
+    # While waiting for payment proof, never send the user back to the main menu.
+    if is_payment_pending(message.from_user.id):
+        process_payment_text(message)
+        return
+    send_welcome(message)
 
 if __name__ == "__main__":
-    print("Bot is running in polling mode...")
-    bot.infinity_polling()
+    print("🤖 ربات سیستم هوشمند AMIR PSYCHOLOGY با موفقیت روشن شد و آماده به کار است...")
+    try:
+        bot.infinity_polling(
+            timeout=60,
+            long_polling_timeout=30,
+            interval=2
+        )
+    except KeyboardInterrupt:
+        print("\n🛑 ربات توسط کاربر به صورت امن متوقف شد.")
